@@ -50,6 +50,22 @@ def get_interface_ip(ifname="eth0"):
             pass
 
 
+def get_local_ip():
+    """Tenta múltiplos nomes de interface para descobrir o IP local."""
+    for ifname in ("eth0", "ens33", "ens38", "enp0s3", "enp0s8", "enp1s0", "wlan0"):
+        ip = get_interface_ip(ifname)
+        if ip and ip not in ("127.0.0.1", "0.0.0.0"):
+            return ip
+    try:
+        _, _, addr_list = socket.gethostbyname_ex(socket.gethostname())
+        for ip in addr_list:
+            if ip not in ("127.0.0.1", "0.0.0.0"):
+                return ip
+    except Exception:
+        pass
+    return "0.0.0.0"
+
+
 class Time(resource.Resource):
     async def render_get(self, request):
         now = datetime.now(timezone.utc).isoformat()
@@ -156,7 +172,7 @@ async def main():
     sensor = Sensor()
     site.add_resource(["sensor"], sensor)
 
-    local_ip = get_interface_ip("eth0") or "0.0.0.0"
+    local_ip = get_local_ip()
 
     await aiocoap.Context.create_server_context(site, bind=(HOST, PORT))
     print(f"CoAP server listening on {HOST}:{PORT}")

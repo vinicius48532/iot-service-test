@@ -4,8 +4,9 @@ Ambiente: QEMU + GNS3. Sem dependência de internet.
 Não recebe argumentos de linha de comando.
 
 Estratégia de descoberta:
-  1. Multicast CoAP para 224.0.1.187:5683 (All CoAP Nodes, RFC 7390)
+  1. Multicast CoAP para 224.0.1.187:5684 (porta dedicada de descoberta)
      Somente multicast, sem varredura unicast.
+  2. Após descoberta, acessa recursos via unicast na porta 5683.
 """
 
 import asyncio
@@ -17,15 +18,17 @@ from aiocoap import Code, Context, Message
 
 COAP_PORT = 5683
 MCAST_GROUP = "224.0.1.187"   # All CoAP Nodes (RFC 7390)
+MCAST_DISCOVERY_PORT = 5684   # Porta dedicada de descoberta
 
 
 def get_interface_ip(ifname="eth0"):
+    """Lê o IP de uma interface via ioctl."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         return socket.inet_ntoa(
             fcntl.ioctl(
                 s.fileno(),
-                0x8915,
+                0x8915,  # SIOCGIFADDR
                 struct.pack("256s", ifname.encode("utf-8")[:15]),
             )[20:24]
         )
@@ -38,6 +41,22 @@ def get_interface_ip(ifname="eth0"):
             pass
 
 
+def get_local_ip():
+    """Tenta múltiplos nomes de interface para descobrir o IP local."""
+    for ifname in ("eth0", "ens33", "ens38", "enp0s3", "enp0s8", "enp1s0", "wlan0"):
+        ip = get_interface_ip(ifname)
+        if ip and ip not in ("127.0.0.1", "0.0.0.0"):
+            return ip
+    try:
+        _, _, addr_list = socket.gethostbyname_ex(socket.gethostname())
+        for ip in addr_list:
+            if ip not in ("127.0.0.1", "0.0.0.0"):
+                return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
 def parse_link_header(text: str):
     resources = []
     parts = text.split(",")
@@ -45,7 +64,6 @@ def parse_link_header(text: str):
         part = part.strip()
         if not part:
             continue
-        # Separa URI dos atributos
         if ";" in part:
             uri_part, attrs_part = part.split(";", 1)
         else:
@@ -80,12 +98,12 @@ async def discover_multicast(local_ip):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    sock.bind(("0.0.0.0", COAP_PORT))
+    sock.bind(("0.0.0.0", MCAST_DISCOVERY_PORT))
     sock.settimeout(2.0)
 
     payload = build_get_wellknown_coap()
-    print(f"[Multicast] Enviando GET /.well-known/core para {MCAST_GROUP}:{COAP_PORT}")
-    sock.sendto(payload, (MCAST_GROUP, COAP_PORT))
+    print(f"[Multicast] Enviando GET /.well-known/core para {MCAST_GROUP}:{MCAST_DISCOVERY_PORT}")
+    sock.sendto(payload, (MCAST_GROUP, MCAST_DISCOVERY_PORT))
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 5.0
@@ -123,6 +141,7 @@ async def discover_multicast(local_ip):
         found.append({"ip": ip_resp, "resources": parse_link_header(payload_text)})
 
     sock.close()
+    print("[Multicast] Socket multicast fechado.")
     return found
 
 
@@ -130,7 +149,7 @@ async def access_resource(ctx, ip, path):
     uri = f"coap://{ip}:{COAP_PORT}{path}"
     req = Message(code=Code.GET, uri=uri)
     try:
-        resp = await asyncio.wait_for(ctx.request(req).response, timeout=3)
+        resp = await asyncio.wait_for(ctx.request(req).response, timeout=5)
         print(f"GET {path} de {ip} -> {resp.code}: {resp.payload.decode()}")
     except Exception as e:
         print(f"Erro ao acessar {path} em {ip}: {e}")
@@ -141,7 +160,7 @@ async def observe_sensor(ctx, ip):
     req = Message(code=Code.GET, uri=uri, observe=0)
     try:
         pending = ctx.request(req)
-        first = await pending.response
+        first = await asyncio.wait_for(pending.response, timeout=5)
         print(f"OBSERVE /sensor de {ip} -> {first.code}: {first.payload.decode()}")
         count = 0
         async for update in pending.observation:
@@ -157,8 +176,8 @@ async def observe_sensor(ctx, ip):
 async def main():
     ctx = await Context.create_client_context()
 
-    local_ip = get_interface_ip("eth0") or "127.0.0.1"
-    print(f"IP local: {local_ip}")
+    local_ip = get_local_ip()
+    print(f"IP local detectado: {local_ip}")
     print()
 
     print("=== DESCOBERTA SOMENTE VIA MULTICAST CoAP ===")
@@ -176,7 +195,6 @@ async def main():
     target = found[0]["ip"]
     print(f"\nUsando primeiro servidor descoberto: {target}\n")
 
-    # Acesso aos recursos via unicast (descoberta já foi feita por multicast)
     await access_resource(ctx, target, "/.well-known/core")
     await access_resource(ctx, target, "/time")
     await observe_sensor(ctx, target)
