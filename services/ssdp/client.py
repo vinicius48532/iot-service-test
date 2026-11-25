@@ -1,27 +1,62 @@
-"""Minimal SSDP client (ssdpy): searches for devices and reads their description.
+"""Minimal SSDP client (ssdpy): busca dispositivos e lê a descrição.
 
-Usage:  python client.py <my-ip>      e.g.  python client.py 192.168.10.10
-  <my-ip>  IP of this machine on the LAN
+Não recebe argumentos de linha de comando. Toda a configuração está
+dentro do script. O IP local é detectado automaticamente (útil em QEMU/GNS3).
 """
 
 import socket
-import sys
 import urllib.request
 
 from ssdpy import SSDPClient
 
-ip = sys.argv[1]
+# =============================================================================
+# Configurações fixas (sem argumentos de linha de comando)
+# =============================================================================
+SEARCH_TIMEOUT = 3   # segundos de espera por respostas
+XML_TIMEOUT = 3      # segundos para baixar o XML de descrição
 
-client = SSDPClient(address=ip, timeout=3)  # waits up to 3 s for answers
-# send the multicast search out of the LAN interface
-client.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
 
-answers = client.m_search("ssdp:all")             # "everybody, answer me!"
-devices = {a["usn"]: a for a in answers}          # one entry per device
+def get_local_ip():
+    """Detecta o endereço IP local da máquina (melhor esforço, sem internet)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(("8.8.8.8", 53))  # não envia pacote, apenas escolhe a interface
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
-print(f"{len(devices)} device(s) found")
-for usn, device in devices.items():
-    print(f"USN:      {usn}")
-    print(f"LOCATION: {device['location']}")
-    xml = urllib.request.urlopen(device["location"], timeout=3).read().decode()
-    print(xml)
+
+def main():
+    ip = get_local_ip()
+
+    client = SSDPClient(address=ip, timeout=SEARCH_TIMEOUT)
+    # envia a busca multicast pela interface LAN
+    client.sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_MULTICAST_IF,
+        socket.inet_aton(ip),
+    )
+
+    print(f"Buscando dispositivos SSDP na interface {ip}...")
+    answers = client.m_search("ssdp:all")  # "everybody, answer me!"
+    devices = {a["usn"]: a for a in answers}  # uma entrada por dispositivo
+
+    print(f"{len(devices)} dispositivo(s) encontrado(s)\n")
+
+    for usn, device in devices.items():
+        location = device.get("location", "N/A")
+        print(f"USN:      {usn}")
+        print(f"LOCATION: {location}")
+        try:
+            xml = urllib.request.urlopen(location, timeout=XML_TIMEOUT).read().decode()
+            print(xml)
+        except Exception as e:
+            print(f"Erro ao baixar descrição de {location}: {e}")
+        print("-" * 40)
+
+
+if __name__ == "__main__":
+    main()

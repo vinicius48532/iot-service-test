@@ -1,27 +1,45 @@
 """Minimal SSDP server (ssdpy): answers "who is out there?" searches (M-SEARCH).
 
-Usage:  python server.py <my-ip> <name>      e.g.  python server.py 192.168.10.11 server1
-  <my-ip>  IP of this machine on the LAN
-  <name>   must be different on every server (it generates the device id)
+Não recebe argumentos de linha de comando. Toda a configuração está
+dentro do script. O IP local é detectado automaticamente (útil em QEMU/GNS3).
 
-The answer contains a LOCATION: a URL where a small XML description is served.
+Responde a buscas SSDP com um LOCATION apontando para um XML de descrição.
 """
 
-import sys
+import signal
+import socket
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Event
 
 from ssdpy import SSDPServer
 
-ip = sys.argv[1]
-name = sys.argv[2]
+# =============================================================================
+# Configurações fixas (sem argumentos de linha de comando)
+# =============================================================================
+SERVICE_NAME = "server1"              # deve ser diferente em cada servidor
+DEVICE_TYPE = "urn:my-domain:service:myservice:1"
+HTTP_PORT = 8000
+MAX_AGE = 1800                        # segundos de cache para os clientes
 
-device_type = "urn:my-domain:service:myservice:1"
-device_id = uuid.uuid5(uuid.NAMESPACE_DNS, name)  # same name -> same id
-location = f"http://{ip}:8000/description.xml"
 
-XML = f"""<?xml version="1.0"?>
+def get_local_ip():
+    """Detecta o endereço IP local da máquina (melhor esforço, sem internet)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(("8.8.8.8", 53))  # não envia pacote, apenas escolhe a interface
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+device_id = uuid.uuid5(uuid.NAMESPACE_DNS, SERVICE_NAME)  # mesmo nome -> mesmo id
+
+XML_TEMPLATE = """<?xml version="1.0"?>
 <root><device>
   <deviceType>{device_type}</deviceType>
   <friendlyName>{name}</friendlyName>
@@ -31,27 +49,64 @@ XML = f"""<?xml version="1.0"?>
 
 
 class Description(BaseHTTPRequestHandler):
-    def do_GET(self):  # anyone who opens the LOCATION gets the XML
+    def do_GET(self):  # quem abrir o LOCATION recebe o XML
         self.send_response(200)
         self.send_header("Content-Type", "text/xml")
         self.end_headers()
-        self.wfile.write(XML.encode())
+        xml = XML_TEMPLATE.format(
+            device_type=DEVICE_TYPE,
+            name=SERVICE_NAME,
+            device_id=device_id,
+        )
+        self.wfile.write(xml.encode())
 
 
-# serve the XML in the background...
-http = HTTPServer(("0.0.0.0", 8000), Description)
-threading.Thread(target=http.serve_forever, daemon=True).start()
+def main():
+    ip = get_local_ip()
+    location = f"http://{ip}:{HTTP_PORT}/description.xml"
 
-# ...and answer SSDP searches in the foreground
-server = SSDPServer(
-    f"uuid:{device_id}::{device_type}",  # unique service name (USN)
-    device_type=device_type,
-    address=ip,                          # use the LAN interface
-    location=location,
-    max_age=1800,                        # how long clients may cache the answer (s)
-)
-print(f"SSDP server for {name} at {ip}  (LOCATION {location})")
-try:
-    server.serve_forever()
-except KeyboardInterrupt:
-    pass
+    # Servidor HTTP para o XML (segundo plano)
+    http = HTTPServer(("0.0.0.0", HTTP_PORT), Description)
+    http_thread = threading.Thread(target=http.serve_forever, daemon=True)
+    http_thread.start()
+
+    # Servidor SSDP para responder buscas (segundo plano, para permitir sinal)
+    server = SSDPServer(
+        f"uuid:{device_id}::{DEVICE_TYPE}",  # USN único
+        device_type=DEVICE_TYPE,
+        address=ip,                          # interface LAN
+        location=location,
+        max_age=MAX_AGE,
+    )
+    ssdp_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    ssdp_thread.start()
+
+    print(f"SSDP server for {SERVICE_NAME} at {ip}  (LOCATION {location})")
+    print("Press Ctrl+C to stop...")
+
+    stop_event = Event()
+
+    def handle_signal(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        while not stop_event.is_set():
+            stop_event.wait(0.5)
+    finally:
+        print("\nShutting down SSDP server...")
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            http.shutdown()
+        except Exception:
+            pass
+        print("Done.")
+
+
+if __name__ == "__main__":
+    main()
