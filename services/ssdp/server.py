@@ -1,13 +1,16 @@
 """Minimal SSDP server (ssdpy): answers "who is out there?" searches (M-SEARCH).
 
 Não recebe argumentos de linha de comando. Toda a configuração está
-dentro do script. O IP local é detectado automaticamente (útil em QEMU/GNS3).
+dentro do script. O IP local é detectado via ioctl da interface eth0
+e o nome do serviço é gerado automaticamente para evitar conflitos de USN.
 
 Responde a buscas SSDP com um LOCATION apontando para um XML de descrição.
 """
 
+import fcntl
 import signal
 import socket
+import struct
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,26 +21,60 @@ from ssdpy import SSDPServer
 # =============================================================================
 # Configurações fixas (sem argumentos de linha de comando)
 # =============================================================================
-SERVICE_NAME = "server1"              # deve ser diferente em cada servidor
 DEVICE_TYPE = "urn:my-domain:service:myservice:1"
 HTTP_PORT = 8000
-MAX_AGE = 1800                        # segundos de cache para os clientes
+MAX_AGE = 1800  # segundos de cache para os clientes
 
 
-def get_local_ip():
-    """Detecta o endereço IP local da máquina (melhor esforço, sem internet)."""
+def get_interface_ip(ifname="eth0"):
+    """Lê o IP de uma interface via ioctl (sem depender de DNS/internet)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0)
-        s.connect(("8.8.8.8", 53))  # não envia pacote, apenas escolhe a interface
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+        return socket.inet_ntoa(
+            fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack("256s", ifname.encode("utf-8")[:15]),
+            )[20:24]
+        )
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
-device_id = uuid.uuid5(uuid.NAMESPACE_DNS, SERVICE_NAME)  # mesmo nome -> mesmo id
+def get_interface_mac(ifname="eth0"):
+    """Lê o endereço MAC de uma interface via ioctl."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        info = fcntl.ioctl(
+            s.fileno(),
+            0x8927,  # SIOCGIFHWADDR
+            struct.pack("256s", ifname.encode("utf-8")[:15]),
+        )
+        return ":".join("%02x" % b for b in info[18:24])
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+ip = get_interface_ip("eth0") or "127.0.0.1"
+mac = get_interface_mac("eth0") or "000000000000"
+
+# Nome único baseado no MAC (ou IP como fallback)
+if mac:
+    SERVICE_NAME = f"server-{mac.replace(':', '')}"
+else:
+    SERVICE_NAME = f"server-{ip.replace('.', '-')}"
+
+device_id = uuid.uuid5(uuid.NAMESPACE_DNS, SERVICE_NAME)  # único por VM
 
 XML_TEMPLATE = """<?xml version="1.0"?>
 <root><device>
@@ -59,10 +96,10 @@ class Description(BaseHTTPRequestHandler):
             device_id=device_id,
         )
         self.wfile.write(xml.encode())
+        self.log_message("XML description served")
 
 
 def main():
-    ip = get_local_ip()
     location = f"http://{ip}:{HTTP_PORT}/description.xml"
 
     # Servidor HTTP para o XML (segundo plano)
@@ -72,7 +109,7 @@ def main():
 
     # Servidor SSDP para responder buscas (segundo plano, para permitir sinal)
     server = SSDPServer(
-        f"uuid:{device_id}::{DEVICE_TYPE}",  # USN único
+        f"uuid:{device_id}::{DEVICE_TYPE}",  # USN único por VM
         device_type=DEVICE_TYPE,
         address=ip,                          # interface LAN
         location=location,
