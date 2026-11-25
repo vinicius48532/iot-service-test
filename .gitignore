@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Runtime files created by deploy/alpine/*.sh
+logs/
+run/
+
+# Large packet captures: keep them out of git (attach to releases instead)
+experiments/captures/large/

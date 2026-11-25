@@ -1,0 +1,1 @@
+run_id,date,protocol,scenario,run_number,configured_latency_ms,configured_jitter_ms,measured_rtt_mean_ms,measured_rtt_stdev_ms,igmp_snooping,ipv6,lib_versions,capture_file,notes
