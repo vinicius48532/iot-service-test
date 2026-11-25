@@ -1,13 +1,15 @@
 """Minimal mDNS browser (zeroconf): encontra serviços anunciados na rede local.
 
 Não recebe argumentos de linha de comando. Toda a configuração está dentro
-do script. O IP local é detectado automaticamente (útil em QEMU/GNS3).
+do script. O IP local é detectado via ioctl da interface eth0 (útil em QEMU/GNS3).
 
 Use Ctrl+C para parar antes do tempo limite.
 """
 
+import fcntl
 import signal
 import socket
+import struct
 from threading import Event
 
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
@@ -19,17 +21,24 @@ SERVICE_TYPE = "_myservice._tcp.local."
 LISTEN_SECONDS = 15  # tempo de escuta em segundos
 
 
-def get_local_ip():
-    """Detecta o endereço IP local da máquina (melhor esforço, sem internet)."""
+def get_interface_ip(ifname="eth0"):
+    """Lê o IP de uma interface via ioctl (sem depender de DNS/internet)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0)
-        s.connect(("8.8.8.8", 53))  # não envia pacote, apenas escolhe a interface
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+        return socket.inet_ntoa(
+            fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack("256s", ifname.encode("utf-8")[:15]),
+            )[20:24]
+        )
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 class Listener(ServiceListener):
@@ -50,7 +59,7 @@ class Listener(ServiceListener):
 
 
 def main():
-    ip = get_local_ip()
+    ip = get_interface_ip("eth0") or "127.0.0.1"
     print(f"mDNS browser listening on interface IP: {ip}")
     print(f"Browsing for {SERVICE_TYPE} for {LISTEN_SECONDS} seconds...")
     print("Press Ctrl+C to stop early.\n")
