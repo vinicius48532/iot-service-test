@@ -1,32 +1,80 @@
-"""Minimal mDNS browser (zeroconf): finds services announced on the local network.
+"""Minimal mDNS browser (zeroconf): encontra serviços anunciados na rede local.
 
-Usage:  python browser.py <my-ip> [seconds]     e.g.  python browser.py 192.168.10.10 5
-  <my-ip>    IP of this machine on the LAN
-  [seconds]  how long to listen (default 5); use a large value to watch services leave
+Não recebe argumentos de linha de comando. Toda a configuração está dentro
+do script. O IP local é detectado automaticamente (útil em QEMU/GNS3).
+
+Use Ctrl+C para parar antes do tempo limite.
 """
 
-import sys
-import time
+import signal
+import socket
+from threading import Event
 
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
-ip = sys.argv[1]
-seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 5
+# =============================================================================
+# Configurações fixas (sem argumentos de linha de comando)
+# =============================================================================
+SERVICE_TYPE = "_myservice._tcp.local."
+LISTEN_SECONDS = 15  # tempo de escuta em segundos
+
+
+def get_local_ip():
+    """Detecta o endereço IP local da máquina (melhor esforço, sem internet)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(("8.8.8.8", 53))  # não envia pacote, apenas escolhe a interface
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 class Listener(ServiceListener):
-    def add_service(self, zc, service_type, name):       # a service appeared
-        info = zc.get_service_info(service_type, name)   # ask for its details
-        print(f"FOUND   {name}  {info.parsed_addresses()}:{info.port}  {info.properties}")
+    def add_service(self, zc, service_type, name):  # um serviço apareceu
+        info = zc.get_service_info(service_type, name)  # pede os detalhes
+        if info is not None:
+            addresses = info.parsed_addresses()
+            addr_str = ", ".join(addresses) if addresses else "?"
+            print(f"FOUND   {name}  {addr_str}:{info.port}  {info.properties}")
+        else:
+            print(f"FOUND   {name}  (no details)")
 
-    def remove_service(self, zc, service_type, name):    # a service said goodbye
+    def remove_service(self, zc, service_type, name):  # um serviço se despediu
         print(f"REMOVED {name}")
 
-    def update_service(self, zc, service_type, name):    # required, unused here
+    def update_service(self, zc, service_type, name):  # obrigatório, não usado aqui
         pass
 
 
-zc = Zeroconf(interfaces=[ip])
-ServiceBrowser(zc, "_myservice._tcp.local.", Listener())
-time.sleep(seconds)
-zc.close()
+def main():
+    ip = get_local_ip()
+    print(f"mDNS browser listening on interface IP: {ip}")
+    print(f"Browsing for {SERVICE_TYPE} for {LISTEN_SECONDS} seconds...")
+    print("Press Ctrl+C to stop early.\n")
+
+    zc = Zeroconf()
+    listener = Listener()
+    ServiceBrowser(zc, SERVICE_TYPE, listener)
+
+    stop_event = Event()
+
+    def handle_signal(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        # Aguarda o tempo configurado ou até o usuário interromper
+        stop_event.wait(LISTEN_SECONDS)
+    finally:
+        print("\nClosing mDNS browser...")
+        zc.close()
+        print("Done.")
+
+
+if __name__ == "__main__":
+    main()
