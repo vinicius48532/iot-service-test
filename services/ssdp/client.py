@@ -48,7 +48,6 @@ def main():
     ip = get_interface_ip("eth0") or "127.0.0.1"
 
     client = SSDPClient(address=ip, timeout=SEARCH_TIMEOUT)
-    # envia a busca multicast pela interface LAN
     client.sock.setsockopt(
         socket.IPPROTO_IP,
         socket.IP_MULTICAST_IF,

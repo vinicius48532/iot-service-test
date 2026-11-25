@@ -77,7 +77,6 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        # Aguarda o tempo configurado ou até o usuário interromper
         stop_event.wait(LISTEN_SECONDS)
     finally:
         print("\nClosing mDNS browser...")

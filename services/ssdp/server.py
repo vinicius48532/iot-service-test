@@ -102,16 +102,14 @@ class Description(BaseHTTPRequestHandler):
 def main():
     location = f"http://{ip}:{HTTP_PORT}/description.xml"
 
-    # Servidor HTTP para o XML (segundo plano)
     http = HTTPServer(("0.0.0.0", HTTP_PORT), Description)
     http_thread = threading.Thread(target=http.serve_forever, daemon=True)
     http_thread.start()
 
-    # Servidor SSDP para responder buscas (segundo plano, para permitir sinal)
     server = SSDPServer(
         f"uuid:{device_id}::{DEVICE_TYPE}",  # USN único por VM
         device_type=DEVICE_TYPE,
-        address=ip,                          # interface LAN
+        address=ip,
         location=location,
         max_age=MAX_AGE,
     )

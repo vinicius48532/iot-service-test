@@ -1,105 +1,62 @@
 """Minimal CoAP server (aiocoap) — descoberta automática de serviços.
 
-Ambiente: QEMU + GNS3.
-Não recebe argumentos de linha de comando. Todos os endereços IP locais
-são detectados automaticamente pelo próprio script.
+Ambiente: QEMU + GNS3. Sem dependência de internet.
+Não recebe argumentos de linha de comando.
 
 Recursos:
   /.well-known/core  -> listagem de serviços (descoberta CoAP RFC 6690)
   /time              -> hora atual em UTC
   /sensor            -> temperatura simulada; suporta CoAP Observe
+
+Descoberta multicast: socket UDP separado em 224.0.1.187:5684 (thread isolada)
+responde a requisições de descoberta com o link format dos recursos.
 """
 
 import asyncio
+import fcntl
 import random
 import signal
 import socket
+import struct
+import threading
 from datetime import datetime, timezone
 
 import aiocoap
 import aiocoap.resource as resource
 from aiocoap import Code, Message
 
-# =============================================================================
-# Configurações fixas (sem argumentos de linha de comando)
-# =============================================================================
-HOST = "0.0.0.0"   # Escuta em todas as interfaces IPv4 da VM
-PORT = 5683        # Porta padrão CoAP
+HOST = "0.0.0.0"
+PORT = 5683
+MCAST_GROUP = "224.0.1.187"   # All CoAP Nodes (RFC 7390)
+MCAST_DISCOVERY_PORT = 5684   # Porta dedicada para descoberta multicast
 
 
-def get_local_ips():
-    """Detecta endereços IP locais (IPv4 e IPv6) da máquina, sem usar internet.
-
-    Combina gethostbyname_ex, getaddrinfo e um bind temporário para descobrir
-    os endereços atribuídos às interfaces de rede (útil em QEMU/GNS3).
-    """
-    ips = set()
-    hostname = socket.gethostname()
-
-    # 1) Via gethostbyname_ex (IPv4 associado ao hostname)
+def get_interface_ip(ifname="eth0"):
     try:
-        _, _, addr_list = socket.gethostbyname_ex(hostname)
-        for ip in addr_list:
-            if ip not in ("127.0.0.1", "0.0.0.0"):
-                ips.add(ip)
-    except Exception:
-        pass
-
-    # 2) Via getaddrinfo (IPv4 e IPv6 associados ao hostname)
-    try:
-        for res in socket.getaddrinfo(hostname, None, 0, socket.SOCK_DGRAM):
-            ip = res[4][0]
-            if ip not in ("127.0.0.1", "::1", "0.0.0.0", "::"):
-                ips.add(ip)
-    except Exception:
-        pass
-
-    # 3) Descobre IP da interface de saída default (UDP connect não envia pacote)
-    for family in (socket.AF_INET, socket.AF_INET6):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(
+            fcntl.ioctl(
+                s.fileno(),
+                0x8915,
+                struct.pack("256s", ifname.encode("utf-8")[:15]),
+            )[20:24]
+        )
+    except OSError:
+        return None
+    finally:
         try:
-            s = socket.socket(family, socket.SOCK_DGRAM)
-            s.settimeout(0)
-            target = ("8.8.8.8", 53) if family == socket.AF_INET else ("2001:4860:4860::8888", 53)
-            s.connect(target)
-            ip = s.getsockname()[0]
-            s.close()
-            if ip and ip not in ("0.0.0.0", "::", "127.0.0.1", "::1"):
-                ips.add(ip)
-        except Exception:
-            try:
-                s.close()
-            except Exception:
-                pass
-
-    # 4) Fallback: bind em porta efêmera para obter um IP local válido
-    if not ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.bind(("0.0.0.0", 0))
-            ips.add(s.getsockname()[0])
             s.close()
         except Exception:
-            ips.add("0.0.0.0")
-
-    return sorted(ips)
+            pass
 
 
 class Time(resource.Resource):
     async def render_get(self, request):
         now = datetime.now(timezone.utc).isoformat()
-        return Message(
-            code=Code.CONTENT,
-            payload=now.encode(),
-            content_format=0,  # text/plain
-        )
+        return Message(code=Code.CONTENT, payload=now.encode(), content_format=0)
 
     def get_link_description(self, request=None):
-        """Metadados usados na descoberta via /.well-known/core."""
-        return {
-            "rt": "time.core",
-            "if": "core.time",
-            "title": "Local time",
-        }
+        return {"rt": "time.core", "if": "core.time", "title": "Local time"}
 
 
 class Sensor(resource.ObservableResource):
@@ -109,7 +66,6 @@ class Sensor(resource.ObservableResource):
         self._task = None
 
     def start(self):
-        """Inicia a atualização em background dentro do loop de eventos."""
         if self._task is None:
             self._task = asyncio.get_running_loop().create_task(self.update_forever())
 
@@ -118,16 +74,12 @@ class Sensor(resource.ObservableResource):
             while True:
                 await asyncio.sleep(1)
                 self.value = round(random.uniform(20, 30), 2)
-                self.updated_state()  # avisa todos os observadores
+                self.updated_state()
         except asyncio.CancelledError:
             pass
 
     async def render_get(self, request):
-        return Message(
-            code=Code.CONTENT,
-            payload=str(self.value).encode(),
-            content_format=0,
-        )
+        return Message(code=Code.CONTENT, payload=str(self.value).encode(), content_format=0)
 
     def stop(self):
         if self._task is not None:
@@ -135,71 +87,106 @@ class Sensor(resource.ObservableResource):
             self._task = None
 
     def get_link_description(self, request=None):
-        """Metadados usados na descoberta via /.well-known/core."""
-        return {
-            "rt": "temperature.sensor",
-            "if": "sensor.single",
-            "title": "Ambient temperature",
-        }
+        return {"rt": "temperature.sensor", "if": "sensor.single", "title": "Ambient temperature"}
+
+
+def build_link_format():
+    links = [
+        "</.well-known/core>",
+        '</time>;rt="time.core";if="core.time";title="Local time"',
+        '</sensor>;rt="temperature.sensor";if="sensor.single";title="Ambient temperature"',
+    ]
+    return ", ".join(links).encode()
+
+
+def multicast_discovery_thread(local_ip, stop_event):
+    """Thread separada para descoberta multicast (sem asyncio)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+
+    sock.bind(("0.0.0.0", MCAST_DISCOVERY_PORT))
+
+    group = socket.inet_aton(MCAST_GROUP)
+    iface = socket.inet_aton(local_ip)
+    membership = group + iface
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    sock.settimeout(1.0)
+
+    print(f"[Multicast] Servidor entrou no grupo {MCAST_GROUP}:{MCAST_DISCOVERY_PORT} na interface {local_ip}")
+
+    while not stop_event.is_set():
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        if len(data) < 4:
+            continue
+        if data[0] == 0x40 and data[1] == 0x01:
+            payload_str = data.decode(errors="ignore")
+            if "well-known" in payload_str and "core" in payload_str:
+                print(f"[Multicast] Descoberta recebida de {addr}")
+                response = build_link_format()
+                msg_id = 0x5678
+                header = bytes([0x50, 0x45, (msg_id >> 8) & 0xFF, msg_id & 0xFF])
+                opt_cf = bytes([0x60]) + b"\x00"
+                payload_marker = bytes([0xFF])
+                full_response = header + opt_cf + payload_marker + response
+                try:
+                    sock.sendto(full_response, addr)
+                    print(f"[Multicast] Resposta enviada para {addr}")
+                except Exception as e:
+                    print(f"[Multicast] Erro ao enviar resposta: {e}")
+
+    sock.close()
 
 
 async def main():
     site = resource.Site()
-
-    # Descoberta padrão CoAP (RFC 6690)
-    site.add_resource(
-        [".well-known", "core"],
-        resource.WKCResource(site.get_resources_as_linkheader),
-    )
-
+    site.add_resource([".well-known", "core"], resource.WKCResource(site.get_resources_as_linkheader))
     site.add_resource(["time"], Time())
 
     sensor = Sensor()
     site.add_resource(["sensor"], sensor)
 
-    # Detecta IPs automaticamente (não vem de argumento nem é hardcoded)
-    local_ips = get_local_ips()
+    local_ip = get_interface_ip("eth0") or "0.0.0.0"
 
-    try:
-        await aiocoap.Context.create_server_context(site, bind=(HOST, PORT))
-    except PermissionError:
-        print(f"ERRO: Sem permissão para bind na porta {PORT}. Execute com sudo.")
-        raise
-    except OSError as e:
-        print(f"ERRO ao iniciar CoAP em {HOST}:{PORT}: {e}")
-        raise
-
+    await aiocoap.Context.create_server_context(site, bind=(HOST, PORT))
     print(f"CoAP server listening on {HOST}:{PORT}")
-    print(f"Detected local IP(s): {', '.join(local_ips)}")
-    print()
-    print("Discovery URLs (use any of the IPs above):")
-    for ip in local_ips:
-        if ":" in ip:
-            print(f"  coap://[{ip}]:{PORT}/.well-known/core")
-        else:
-            print(f"  coap://{ip}:{PORT}/.well-known/core")
-    print()
-    print("Resources:")
-    print("  GET /.well-known/core   -> service discovery")
-    print("  GET /time               -> current UTC time")
-    print("  GET /sensor             -> simulated temperature (observable)")
+    print(f"Local IP: {local_ip}")
+    print("Resources: /.well-known/core, /time, /sensor")
+
+    stop_event = threading.Event()
+    mcast_thread = threading.Thread(
+        target=multicast_discovery_thread,
+        args=(local_ip, stop_event),
+        daemon=True
+    )
+    mcast_thread.start()
 
     sensor.start()
 
     loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
+    stop_asyncio = asyncio.Event()
 
     def handle_signal():
+        stop_asyncio.set()
         stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, handle_signal)
-        except (NotImplementedError, Exception):
+        except Exception:
             pass
 
-    await stop_event.wait()
-
+    await stop_asyncio.wait()
     sensor.stop()
     print("\nServer stopped.")
 
